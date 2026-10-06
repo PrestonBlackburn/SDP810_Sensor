@@ -16,27 +16,17 @@ static const char *TAG = "diff_pressure";
 #define I2C_MASTER_SCL_IO           9/*!< GPIO number used for I2C master clock */
 #define I2C_MASTER_SDA_IO           8 /*!< GPIO number used for I2C master data  */
 #define I2C_MASTER_NUM              I2C_NUM_0 /*!< I2C port number for master dev */
-#define I2C_MASTER_FREQ_HZ          400000 /*!< I2C master clock frequency */
+#define I2C_MASTER_FREQ_HZ          400000 /*!< I2C master clock frequency 400kHz-1000kHz */
 // #define I2C_MASTER_TIMEOUT_MS       1000
-#define SENSOR_ADDR         0x00        /*!< Address of the Sensiron sensor */
+#define SENSOR_ADDR         0x25        /*!< Address of the Sensiron sensor */
 
 // Sensor properties
-#define MAX_PRESSURE 500
-#define MIN_PRESSURE -500
-#define MAX_TEMP 80
-#define MIN_TEMP -40
-
-void print_bits(uint8_t *value) {
-    for (int i = 7; i>=0; i--) {
-        uint8_t bit  = (*value >> i) & 1;
-        printf("%d", bit);
-    }
-    printf("\n");
-}
+#define PRESSURE_SCALE_FACTOR 240 /* Pascals */
+#define TEMP_SCALE_FACTOR 200 /* C */
 
 void app_main(void)
 {
-    printf("Startup -- \n");
+    ESP_LOGI(TAG, "Initializing I2C Master Bus...");
     /* Print chip information */
    
     i2c_master_bus_config_t i2c_mst_config = {
@@ -49,7 +39,6 @@ void app_main(void)
     };
     i2c_master_bus_handle_t bus_handle;
     ESP_ERROR_CHECK(i2c_new_master_bus(&i2c_mst_config, &bus_handle));
-
     
     i2c_device_config_t dev_config = {
         .dev_addr_length = I2C_ADDR_BIT_LEN_7,
@@ -60,28 +49,44 @@ void app_main(void)
     ESP_ERROR_CHECK(i2c_master_bus_add_device(bus_handle, &dev_config, &dev_handle));
 
     ESP_LOGI(TAG, "I2C Initialized successfully");
-    ESP_LOGI(TAG, "Starting continuous I2C read loop...");
 
+    // Reset any existing continuous measurement /soft reset
+    uint8_t stop_cmd[] = {0x3F, 0xF9};
+    esp_err_t stop_ret = i2c_master_transmit(dev_handle, stop_cmd, sizeof(stop_cmd), 100);
+    vTaskDelay(pdMS_TO_TICKS(20));
+    if (stop_ret == ESP_OK) {
+        ESP_LOGI(TAG, "Stopped any existing measurements");
+    } else {
+        ESP_LOGE(TAG, "Stop Config Failed: %s", esp_err_to_name(stop_ret));
+        return;
+    }
+
+    // Set to Continuous Measurement Mode 
+    // 0x361E: Diff Pressure, no averaging 0.5ms update
+    uint8_t config_cmd[] = {0x36, 0x1E};    
+
+    esp_err_t ret = i2c_master_transmit(
+        dev_handle,
+        config_cmd,
+        sizeof(config_cmd),
+        1000
+    );
+
+    if (ret == ESP_OK) {
+        ESP_LOGI(TAG, "Config success");
+    } else {
+        ESP_LOGE(TAG, "Config Failed: %s", esp_err_to_name(ret));
+        return;
+    }
+
+    ESP_LOGI(TAG, "Continuous Measurement Mode Started");
+    // First measurement after 8ms
+    vTaskDelay(pdMS_TO_TICKS(15));
+
+    // Read Loop
+    // 3 bytes DP (MSB, LSB, CRC), 3 bytes Temp (MSB, LSB, CRC)
+    uint8_t raw_data[9] = {0};
     while (1) {
-        // config sequence - (0xAA, 0x00, 0x80)
-        uint8_t config_cmd[] = {0xAA, 0x00, 0x80};
-
-        esp_err_t ret = i2c_master_transmit(
-            dev_handle,
-            config_cmd,
-            sizeof(config_cmd),
-            1000
-        );
-
-        if (ret == ESP_OK) {
-            ESP_LOGI(TAG, "Config success");
-        } else {
-            ESP_LOGE(TAG, "Config Failed: %s", esp_err_to_name(ret));
-        }
-
-        vTaskDelay(pdMS_TO_TICKS(100));
-    
-        uint8_t raw_data[7] = {0};
         ret = i2c_master_receive(
             dev_handle, 
             raw_data, 
@@ -89,36 +94,32 @@ void app_main(void)
             1000
         );
 
+        int16_t raw_dp = 0;
+        int16_t raw_temp = 0;
+        int16_t scale_factor = 0;
         if (ret == ESP_OK) {
-            
-            printf("Got Bytes: \n");
-            size_t raw_len = sizeof(raw_data) / sizeof(raw_data[0]);
-            for (size_t i = 0; i < raw_len; i++) {
-                printf("Bit %d: ", i);
-                print_bits(&raw_data[i]);
-            }
-            uint8_t status = raw_data[0]; 
-            // reconstruct 24-bit values
-            uint32_t raw_p_24 = ((uint32_t)raw_data[1] << 16) | ((uint32_t)raw_data[2] << 8) | (uint32_t)raw_data[3];
-            uint32_t raw_t_24 = ((uint32_t)raw_data[4] << 16) | ((uint32_t)raw_data[5] << 8) | (uint32_t)raw_data[6];
-            // shift based on actual data
-            uint16_t pressure_bits = (raw_p_24 >> 10) & 0x3FFF; // 14 bit
-            uint16_t temp_bits = (raw_t_24 >> 8) & 0xFFFF; // 16 bit
-            
-            uint32_t timestamp_ms = pdTICKS_TO_MS(xTaskGetTickCount());
+            raw_dp = (int16_t)((raw_data[0] << 8) | raw_data[1]);
+            raw_temp = (int16_t)((raw_data[3] << 8) | raw_data[4]);
+            scale_factor = (int16_t)((raw_data[6] << 8) | raw_data[7]);
 
-            float pressure_pa = (((MAX_PRESSURE - MIN_PRESSURE) * (float)pressure_bits) / pow(2, 14))  + MIN_PRESSURE;
-            float temp_c = (((MAX_TEMP - MIN_TEMP) * (float)temp_bits) / pow(2, 16)) + MIN_TEMP;
-            printf("DATA,%lu,%.2f,%.2f\n", (unsigned long)timestamp_ms, pressure_pa, temp_c);
-           
-            
-            ESP_LOGI(TAG, "32 bit counts: \nPresure: %u | Temp: %u\n", raw_p_24, raw_t_24);
-            ESP_LOGI(TAG, "raw counts: \nPressure: %u | Temp: %u\n", pressure_bits, temp_bits);
+            // ESP_LOGI(TAG, "Raw DP: %d | Raw Temp: %d", raw_dp, raw_temp);
         } else {
-            ESP_LOGE(TAG, "Read Failed: %s", esp_err_to_name(ret));
+            ESP_LOGE(TAG, "Read failed: %s", esp_err_to_name(ret));
         }
 
+        if (ret == ESP_OK) {
+            // calc actual diff pressure values (Pa)
+            float pressure_pa = 0.0f;
+            if (scale_factor != 0) {
+                pressure_pa = (float)raw_dp / (float)scale_factor;
+            }
+            float temp_c = (float)raw_temp / 200.0f;
+            ESP_LOGI(TAG, "Pressure: %.4f Pa | Temp: %.2f C | (Scale Factor: %d)", 
+                     pressure_pa, temp_c, scale_factor);
+        } else {
+            ESP_LOGE(TAG, "Calc failed: %s", esp_err_to_name(ret));
+        }
+        vTaskDelay(pdMS_TO_TICKS(5));
+        
     }
-
-
 }
