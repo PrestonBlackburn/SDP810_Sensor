@@ -1,25 +1,41 @@
 | Supported Targets | ESP32 | ESP32-C2 | ESP32-C3 | ESP32-C5 | ESP32-C6 | ESP32-C61 | ESP32-H2 | ESP32-H21 | ESP32-H4 | ESP32-P4 | ESP32-S2 | ESP32-S3 | ESP32-S31 | Linux |
 | ----------------- | ----- | -------- | -------- | -------- | -------- | --------- | -------- | --------- | -------- | -------- | -------- | -------- | --------- | ----- |
 
-# Hello World Example
+# Example For SDP810 Differential Pressure Sensor
 
-Starts a FreeRTOS task to print "Hello World".
-
-(See the README.md file in the upper level 'examples' directory for more information about examples.)
+Captures time series data and provides some lightweight processing
 
 ## How to use example
 
-Follow detailed instructions provided specifically for this example.
+Setup python venv (assuming uv is already installed)
+```bash
+uv venv
+source ./.venv/bin/activate
+pip install -r requirements.txt
+```
 
-Select the instructions depending on Espressif chip installed on your development board:
+Setup expressif idf
+```bash
+source ${ESP_IDF_DIR}/export.sh
+# ex:
+source ~/hardware_projects/esp-idf/export.sh
+```
 
-- [ESP32 Getting Started Guide](https://docs.espressif.com/projects/esp-idf/en/stable/get-started/index.html)
-- [ESP32-S2 Getting Started Guide](https://docs.espressif.com/projects/esp-idf/en/latest/esp32s2/get-started/index.html)
+Setup target, ex:
+```bash
+idf.py set-target esp32s3
+```
 
+build and flash
+```bash
+idf.py build
+idf.py flash
+idf.py montior
+```
 
 ## Example folder contents
 
-The project **hello_world** contains one source file in C language [hello_world_main.c](main/hello_world_main.c). The file is located in folder [main](main).
+The project **pressure_sensor** contains one source file in C language [pressure_sensor_main.c](main/pressure_sensor_main.c). The file is located in folder [main](main).
 
 ESP-IDF projects are built using CMake. The project build configuration is contained in `CMakeLists.txt` files that provide set of directives and instructions describing the project's source files and targets (executable, library, or both).
 
@@ -27,10 +43,11 @@ Below is short explanation of remaining files in the project folder.
 
 ```
 ├── CMakeLists.txt
-├── pytest_hello_world.py      Python script used for automated testing
+├── pytest_pressure_sensor.py  Python script used for automated testing
+├── chart.py                   Chart data captured from stdout
 ├── main
 │   ├── CMakeLists.txt
-│   └── hello_world_main.c
+│   └── pressure_sensor_main.c Main logic
 └── README.md                  This is the file you are currently reading
 ```
 

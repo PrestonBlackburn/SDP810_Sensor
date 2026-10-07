@@ -16,7 +16,7 @@ static const char *TAG = "diff_pressure";
 #define I2C_MASTER_SCL_IO           9/*!< GPIO number used for I2C master clock */
 #define I2C_MASTER_SDA_IO           8 /*!< GPIO number used for I2C master data  */
 #define I2C_MASTER_NUM              I2C_NUM_0 /*!< I2C port number for master dev */
-#define I2C_MASTER_FREQ_HZ          400000 /*!< I2C master clock frequency 400kHz-1000kHz */
+#define I2C_MASTER_FREQ_HZ          100000 /*!< I2C master clock frequency 400kHz-1000kHz */
 // #define I2C_MASTER_TIMEOUT_MS       1000
 #define SENSOR_ADDR         0x25        /*!< Address of the Sensiron sensor */
 
@@ -49,6 +49,9 @@ void app_main(void)
     ESP_ERROR_CHECK(i2c_master_bus_add_device(bus_handle, &dev_config, &dev_handle));
 
     ESP_LOGI(TAG, "I2C Initialized successfully");
+
+    esp_err_t p = i2c_master_probe(bus_handle, SENSOR_ADDR, 100);
+    ESP_LOGI(TAG, "Probe 0x%02X: %s", SENSOR_ADDR, esp_err_to_name(p));
 
     // Reset any existing continuous measurement /soft reset
     uint8_t stop_cmd[] = {0x3F, 0xF9};

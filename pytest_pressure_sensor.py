@@ -13,21 +13,21 @@ from pytest_embedded_qemu.dut import QemuDut
 
 @pytest.mark.generic
 @idf_parametrize('target', ['supported_targets', 'preview_targets'], indirect=['target'])
-def test_hello_world(dut: IdfDut, log_minimum_free_heap_size: Callable[..., None]) -> None:
+def test_pressure_sensor(dut: IdfDut, log_minimum_free_heap_size: Callable[..., None]) -> None:
     dut.expect('Hello world!')
     log_minimum_free_heap_size()
 
 
 @pytest.mark.host_test
 @idf_parametrize('target', ['linux'], indirect=['target'])
-def test_hello_world_linux(dut: IdfDut) -> None:
+def test_pressure_sensor_linux(dut: IdfDut) -> None:
     dut.expect('Hello world!')
 
 
 @pytest.mark.host_test
 @pytest.mark.macos
 @idf_parametrize('target', ['linux'], indirect=['target'])
-def test_hello_world_macos(dut: IdfDut) -> None:
+def test_pressure_sensor_macos(dut: IdfDut) -> None:
     dut.expect('Hello world!')
 
 
@@ -47,7 +47,7 @@ def verify_elf_sha256_embedding(app: QemuApp, sha256_reported: str) -> None:
 
 @pytest.mark.qemu
 @idf_parametrize('target', ['esp32', 'esp32c3'], indirect=['target'])
-def test_hello_world_host(app: QemuApp, dut: QemuDut) -> None:
+def test_pressure_sensor_host(app: QemuApp, dut: QemuDut) -> None:
     sha256_reported = dut.expect(r'ELF file SHA256:\s+([a-f0-9]+)').group(1).decode('utf-8')
     verify_elf_sha256_embedding(app, sha256_reported)
 
