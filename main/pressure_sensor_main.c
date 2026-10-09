@@ -1,11 +1,15 @@
 #include <stdio.h>
 #include <stdint.h>
+#include <stdbool.h>
 #include <math.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
+#include "freertos/queue.h"
 #include "driver/i2c_master.h"
 #include "esp_log.h"
+#include "esp_timer.h"
+#include "esp_system.h"
 
 
 static const char *TAG = "diff_pressure";
@@ -18,17 +22,41 @@ static const char *TAG = "diff_pressure";
 #define SENSOR_ADDR         0x25        /*!< Address of the Sensiron sensor */
 
 // Sensor properties
+#define READING_MAX_LEN 512
 #define PRESSURE_SCALE_FACTOR 240 /* Pascals */
 #define TEMP_SCALE_FACTOR 200 /* C */
 
 // Calculation properties
-#define N_SAMPLES 500 // about 100 samples/sec (5 sec window)
-static int16_t raw_pressure_arr[N_SAMPLES];
-static int16_t raw_temp_arr[N_SAMPLES];
+#define BATCH_MAX 512 // about 100 samples/sec (5 sec window)
+static int16_t raw_pressure_arr[BATCH_MAX];
+static int16_t raw_temp_arr[BATCH_MAX];
 static SemaphoreHandle_t rb_lock; // for keeping press + temp readings in sync
+
+typedef struct {
+    int n;
+    int64_t t0_us; // batch timestamp
+    int16_t pressure_scale; 
+    int16_t temperature_scale;
+    int16_t pressure_raw[BATCH_MAX];
+    int16_t temperature_raw[BATCH_MAX];
+} sse_live_msg_t;
+
+typedef struct {
+    int n;                            // samples in summary
+    float avg_p, min_p, max_p, std_p; // Pa
+    float avg_t;                      // C
+    // additional metadata
+    int heap_free;
+    int uptime;
+} sse_summary_msg_t;
+
+static QueueHandle_t sse_live_queue;
+static QueueHandle_t sse_summary_queue;
 
 TaskHandle_t SensorReadHandle = NULL;
 TaskHandle_t SesnorProcessHandle = NULL;
+TaskHandle_t QueueTestReadHandle = NULL;
+
 
 // setup ring buffers
 typedef struct {
@@ -38,21 +66,21 @@ typedef struct {
     const int maxlen;
 } measurement_ring_buffer_t;
 
-int16_t pressure_reading_space[512];
-int16_t temperature_reading_space[512];
+int16_t pressure_reading_space[READING_MAX_LEN];
+int16_t temperature_reading_space[READING_MAX_LEN];
 
 measurement_ring_buffer_t pressure_reading_ring_buffer = {
     .buffer = pressure_reading_space,
     .head = 0,
     .tail = 0,
-    .maxlen = 512
+    .maxlen = READING_MAX_LEN
 };
 
 measurement_ring_buffer_t temperature_reading_ring_buffer = {
     .buffer = temperature_reading_space,
     .head = 0,
     .tail = 0,
-    .maxlen = 512
+    .maxlen = READING_MAX_LEN
 };
 
 int circ_bbuf_push(measurement_ring_buffer_t *c, int16_t data) {
@@ -218,7 +246,8 @@ void sensor_read_task(void *pvParameters) {
         } else {
             ESP_LOGE(TAG, "Calc failed: %s", esp_err_to_name(ret));
         }
-        vTaskDelay(pdMS_TO_TICKS(10));
+        // slight subsampling
+        vTaskDelay(pdMS_TO_TICKS(2));
     }
     
     vTaskDelete(NULL); 
@@ -226,34 +255,113 @@ void sensor_read_task(void *pvParameters) {
 }
 
 void sensor_process_task(void *pvParameters) {
+    (void)pvParameters;
+
+    static sse_live_msg_t live_msg;
+    static sse_summary_msg_t summary_msg;
+
+    // tracking for summary stats
+    int64_t p_sum = 0;
+    int64_t p_sumsq = 0;
+    int64_t t_sum = 0;
+    int16_t p_min = INT16_MAX;
+    int16_t p_max = INT16_MIN;
+    int32_t acc_n = 0;   // summary frequency is different than live
+    int64_t window_start = esp_timer_get_time();
+
+    live_msg.pressure_scale = PRESSURE_SCALE_FACTOR;
+    live_msg.temperature_scale = TEMP_SCALE_FACTOR;
+
+    TickType_t last_wake = xTaskGetTickCount();
+
 
     for (;;) {
+        int n = 0;
         xSemaphoreTake(rb_lock, portMAX_DELAY);
-        int n_returned_samples = circ_bbuf_peek_latest(
-            &pressure_reading_ring_buffer,
-            raw_pressure_arr,
-            N_SAMPLES
-        );
-        circ_bbuf_peek_latest(
-            &temperature_reading_ring_buffer,
-            raw_temp_arr,
-            N_SAMPLES
-        );
+        while (n < BATCH_MAX && circ_bbuf_pop(
+                &pressure_reading_ring_buffer,
+                &raw_pressure_arr[n]) == 0) {
+                    circ_bbuf_pop(
+                        &temperature_reading_ring_buffer,
+                        &raw_temp_arr[n]);
+                    n++;
+
+                    }
         xSemaphoreGive(rb_lock);
 
-        if (n_returned_samples > 0) {
-            int32_t press_sum = 0;
-            int32_t temp_sum = 0;
-            for (int i=0; i < n_returned_samples; i++) {
-                press_sum += raw_pressure_arr[i];
-                temp_sum += raw_temp_arr[i];
+        // collection path
+        if (n > 0) {
+            // live data collection
+            live_msg.n = n;
+            live_msg.t0_us = esp_timer_get_time();
+            memcpy(live_msg.pressure_raw, raw_pressure_arr, n * sizeof(int16_t));
+            memcpy(live_msg.temperature_raw, raw_temp_arr, n * sizeof(int16_t));
+            if (xQueueSend(sse_live_queue, &live_msg, 0) != pdTRUE) {
+                // sse side is behind, drop old values
             }
-            float avg_pressure_pa = (float)press_sum / n_returned_samples / PRESSURE_SCALE_FACTOR;
-            float avg_temp_c = (float)temp_sum / n_returned_samples / TEMP_SCALE_FACTOR;
-            ESP_LOGI(TAG, "Samples: %d | Pressure: %.4f Pa | Temp: %.2f", 
-                n_returned_samples, avg_pressure_pa, avg_temp_c);
+
+            // summary collector
+            for (int i = 0; i < n; i++) {
+                int16_t p = raw_pressure_arr[i];
+                p_sum += p;
+                p_sumsq += (int32_t)p * p;
+                t_sum += raw_temp_arr[i];
+                if (p < p_min) p_min = p;
+                if (p > p_max) p_max = p;
+            }
+            acc_n += n;
         }
-        vTaskDelay(pdMS_TO_TICKS(1000));
+
+        // reset summary counter
+        int64_t now = esp_timer_get_time();
+        if (now - window_start >= 1000000 && acc_n > 0) {
+            float mean_raw = (float)p_sum / acc_n;
+            float var_raw = (float)p_sumsq / acc_n - mean_raw * mean_raw;
+            if (var_raw < 0) {
+                var_raw = 0;
+            }
+
+            summary_msg.n = acc_n;
+            summary_msg.avg_p = mean_raw / PRESSURE_SCALE_FACTOR;
+            summary_msg.min_p = (float)p_min / PRESSURE_SCALE_FACTOR;
+            summary_msg.max_p = (float)p_max / PRESSURE_SCALE_FACTOR;
+            summary_msg.std_p = sqrtf(var_raw) / PRESSURE_SCALE_FACTOR;
+            summary_msg.avg_t = ((float)t_sum / acc_n) / TEMP_SCALE_FACTOR;
+            summary_msg.heap_free = esp_get_free_heap_size();
+            summary_msg.uptime = (uint32_t)(now / 1000000);
+            xQueueSend(sse_summary_queue, &summary_msg, 0);
+
+            // reset
+            p_sum = 0;
+            p_sumsq = 0;
+            t_sum = 0;
+            p_min = INT16_MAX;
+            p_max = INT16_MIN;
+            acc_n = 0;
+            window_start = now;
+        }
+
+        vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(100));
+    }
+}
+
+void test_queue_consume(void *pvParameters) {
+    (void)pvParameters;
+
+    static sse_live_msg_t live_msg_recv;
+    // static sse_summary_msg_t summary_msg_recv;
+
+    for(;;) {
+        if (xQueueReceive(
+            sse_live_queue,
+            &live_msg_recv,
+            portMAX_DELAY) == pdPASS) {
+                printf("Queued Samples: %d\n", 
+                    live_msg_recv.n
+                    );
+            }
+
+        vTaskDelay(pdMS_TO_TICKS(100));
     }
 }
 
@@ -261,8 +369,12 @@ void sensor_process_task(void *pvParameters) {
 void app_main(void)
 {
     rb_lock = xSemaphoreCreateMutex();
-    if (rb_lock == NULL) {
-        ESP_LOGE(TAG, "Failed to create ring buffer mutex");
+
+    sse_live_queue = xQueueCreate(4, sizeof(sse_live_msg_t));
+    sse_summary_queue = xQueueCreate(2, sizeof(sse_summary_msg_t));
+
+    if (rb_lock == NULL || !sse_live_queue || !sse_summary_queue) {
+        ESP_LOGE(TAG, "Failed to create ring buffer mutex or queues");
         return;
     }
 
@@ -290,6 +402,20 @@ void app_main(void)
     );
 
     if (xProcessReturned == pdPASS) {
+        // Task was created successfully
+    }
+
+
+    BaseType_t xTestQueueRead = xTaskCreate(
+        test_queue_consume,
+        "QUEUE_TEST",
+        4096,
+        NULL,
+        1,
+        &QueueTestReadHandle
+    );
+
+    if (xTestQueueRead == pdPASS) {
         // Task was created successfully
     }
 

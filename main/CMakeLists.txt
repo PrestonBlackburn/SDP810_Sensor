@@ -1,3 +1,3 @@
 idf_component_register(SRCS "pressure_sensor_main.c" "test_ring_buffer.c"
-                       PRIV_REQUIRES esp_driver_i2c spi_flash
+                       PRIV_REQUIRES esp_driver_i2c spi_flash esp_timer
                        INCLUDE_DIRS "")
